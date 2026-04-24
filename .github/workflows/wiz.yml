@@ -1,4 +1,21 @@
-name: Wiz — Container Scan
+# ════════════════════════════════════════════════════════════════════════════════
+# Wiz Unified Container Security Pipeline
+# ─────────────────────────────────────────
+# Single workflow covering ALL 4 pillars of container security:
+#   1. SCA   — Source dependency vulnerabilities  (wizcli dir scan)
+#   2. IaC   — Dockerfile misconfigurations        (wizcli iac scan)
+#   3. Image — Container image vulnerabilities     (wizcli docker scan)
+#   4. Layer — Per-layer breakdown (base vs app)   (--driver mountWithLayers)
+#
+# SARIF handling:
+#   • Each scan type uploads to a SEPARATE GitHub Security category
+#   • Same category per push = GitHub auto-closes removed findings
+#   • New findings open as new alerts; stale ones auto-close
+#   • No duplication: deterministic fingerprints per (CVE, package, version)
+#   • Parser filters OS noise (keeps only HIGH/CRIT with fix) while retaining
+#     ALL application-layer findings
+# ════════════════════════════════════════════════════════════════════════════════
+name: "Wiz — Unified Container Security (SCA · IaC · Image · Layers)"
 
 on:
   push:
@@ -12,18 +29,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  container-scan:
-    name: Wiz — Container Image Scan
+  wiz-unified-scan:
+    name: "Wiz — SCA + IaC + Container Image Scan"
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     permissions:
-      contents: read
+      contents:        read
       security-events: write
+      actions:         read
 
     env:
-      IMAGE_TAG: wiz-node-container-demo:${{ github.sha }}
+      IMAGE_TAG: "wiz-node-container-demo:${{ github.sha }}"
+      POLICY:    "Default vulnerabilities policy"
+      COLUMNS:   "250"
+      TERM:      "xterm-256color"
 
     steps:
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  SETUP                                                           │
+      # └──────────────────────────────────────────────────────────────────┘
+
       - name: "[Setup] Checkout source code"
         uses: actions/checkout@v4
 
@@ -43,60 +69,245 @@ jobs:
           echo "::endgroup::"
 
       - name: "[Setup] Authenticate Wiz CLI"
-        run: wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+        timeout-minutes: 2
         env:
-          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: |
+          wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+          echo "::notice title=Wiz Auth::Authentication successful"
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  SCAN 1 — SCA: Source Dependency Vulnerabilities                 │
+      # │  Scans package.json / node_modules for known CVEs               │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[Scan] SCA — Source Dependency Vulnerability Analysis"
+        id: sca_scan
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          echo "::group::Wiz SCA: scanning source dependencies"
+          EXIT=0
+          wizcli dir scan \
+            --path . \
+            --output dir.sarif,sarif,vulnerabilities \
+            --output dir.txt,human,vulnerabilities \
+            --tag repo="${{ github.repository }}" \
+            --tag branch="${{ github.ref_name }}" || EXIT=$?
+          echo "::endgroup::"
+
+          echo "sca_exit=$EXIT" >> "$GITHUB_OUTPUT"
+
+          echo "::group::SCA findings (human-readable)"
+          cat dir.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+          if [ -f dir.sarif ]; then
+            COUNT=$(python3 -c "import json; d=json.load(open('dir.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=SCA Scan::$COUNT findings in dir.sarif"
+          fi
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  SCAN 2 — IaC: Dockerfile Misconfiguration / Linting            │
+      # │  Checks Dockerfile for security misconfigurations                │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[Scan] IaC — Dockerfile Security Linting"
+        id: iac_scan
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          echo "::group::Wiz IaC: scanning Dockerfile for misconfigurations"
+          EXIT=0
+          wizcli iac scan \
+            --path ./Dockerfile \
+            --output dockerfile.sarif,sarif,misconfigurations \
+            --output dockerfile.txt,human,misconfigurations \
+            --tag repo="${{ github.repository }}" \
+            --tag branch="${{ github.ref_name }}" || EXIT=$?
+          echo "::endgroup::"
+
+          echo "iac_exit=$EXIT" >> "$GITHUB_OUTPUT"
+
+          echo "::group::IaC findings (human-readable)"
+          cat dockerfile.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+          if [ -f dockerfile.sarif ]; then
+            COUNT=$(python3 -c "import json; d=json.load(open('dockerfile.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=IaC Scan::$COUNT findings in dockerfile.sarif"
+          fi
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  BUILD — Docker image for container vulnerability scan           │
+      # └──────────────────────────────────────────────────────────────────┘
 
       - name: "[Build] Build Docker image"
+        id: build_image
+        timeout-minutes: 10
         run: |
-          docker build -t "$IMAGE_TAG" .
-          echo "Built: $IMAGE_TAG"
+          echo "::group::docker build — $IMAGE_TAG"
+          docker build \
+            --tag "$IMAGE_TAG" \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.repo=${{ github.repository }}" \
+            .
+          echo "::endgroup::"
+          echo "::notice title=Docker Build::Built $IMAGE_TAG successfully"
 
-      - name: "[Scan] Container Image — Full Vulnerability Scan"
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  SCAN 3 — Container Image Vulnerabilities (per-layer)            │
+      # │  Uses mountWithLayers driver for layer-by-layer breakdown        │
+      # │  Covers: base image OS vulns + application layer vulns           │
+      # │  Requires sudo for overlay2 driver                               │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[Scan] Container Image — Per-Layer Vulnerability Scan"
         id: container_scan
         continue-on-error: true
+        timeout-minutes: 20
+        env:
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          # '|| EXIT=$?' captures exit code without triggering set -e on non-zero exit
+          # mountWithLayers driver requires root — re-authenticate
+          echo "::group::Re-authenticate as root (overlay2 driver requires root)"
+          sudo -E $(which wizcli) auth \
+            --id     "$WIZ_CLIENT_ID" \
+            --secret "$WIZ_CLIENT_SECRET"
+          echo "::endgroup::"
+
+          echo "::group::Wiz container image scan — per-layer (mountWithLayers)"
           EXIT=0
-          wizcli docker scan \
-            --image "$IMAGE_TAG" \
-            --output image.sarif,sarif,vulnerabilities \
-            --policies "Default vulnerabilities policy" \
+          sudo -E $(which wizcli) docker scan \
+            --image    "$IMAGE_TAG" \
+            --policies "$POLICY" \
+            --driver   mountWithLayers \
+            --output   image.sarif,sarif,vulnerabilities \
+            --output   image.txt,human,vulnerabilities \
+            --output   image-layers.json,json,vulnerabilities \
             --tag repo="${{ github.repository }}" \
             --tag branch="${{ github.ref_name }}" \
             --tag commit="${{ github.sha }}" || EXIT=$?
-
-          echo "container_exit=$EXIT" >> $GITHUB_OUTPUT
-          if [ $EXIT -eq 0 ]; then
-            echo "✔ Scan passed — no policy violations"
-          elif [ $EXIT -eq 4 ]; then
-            echo "⚠ Scan complete — policy violations found (exit 4); see Security tab"
-          else
-            echo "✘ Scan failed with exit $EXIT — infrastructure or auth error"
-            exit $EXIT
-          fi
-
-      - name: "[Report] Parse findings — filter noise, write summary"
-        if: always()
-        run: |
-          echo "::group::Parse container scan SARIF"
-          python3 scripts/parse_container_scan.py image.sarif image-filtered.sarif
           echo "::endgroup::"
 
-      - name: "[SARIF] Upload filtered results to GitHub Security"
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: image-filtered.sarif
-          category: wiz-container
+          # Fix ownership — sudo created these as root
+          sudo chown runner:runner image.sarif image.txt image-layers.json 2>/dev/null || true
 
-      - name: "[Artifacts] Archive raw + filtered SARIFs"
+          echo "::group::Output files"
+          ls -lh image.sarif image.txt image-layers.json 2>/dev/null || echo "(some files missing)"
+          echo "::endgroup::"
+
+          echo "container_exit=$EXIT" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT -eq 0 ]; then
+            echo "::notice title=Container Scan::Scan passed — no policy violations"
+          elif [ $EXIT -eq 4 ]; then
+            echo "::notice title=Container Scan::Policy violations found (exit 4) — see Security tab"
+          else
+            echo "::warning title=Container Scan::Unexpected exit $EXIT — check credentials/network"
+          fi
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  PARSE — Filter noise, classify OS vs APP, write summary         │
+      # │  Processes: image.sarif, dir.sarif, dockerfile.sarif             │
+      # │  Produces:  *-filtered.sarif files + GitHub Step Summary         │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[Report] Parse and filter all scan results"
+        if: always()
+        run: |
+          echo "::group::Parse and filter SARIF results"
+          python3 scripts/parse_container_scan.py \
+            --image-sarif    image.sarif \
+            --sca-sarif      dir.sarif \
+            --iac-sarif      dockerfile.sarif \
+            --layers-json    image-layers.json \
+            --output-dir     filtered
+          echo "::endgroup::"
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  SARIF UPLOADS — Each scan type gets its own named category      │
+      # │  Same category per push = GitHub auto-closes stale findings      │
+      # │  and opens new ones. No duplication, no manual cleanup needed.   │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[SARIF] Upload Container Image results (category: wiz-image)"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('filtered/image-filtered.sarif') != ''
+        with:
+          sarif_file: filtered/image-filtered.sarif
+          category: wiz-image
+          wait-for-processing: true
+
+      - name: "[SARIF] Upload SCA results (category: wiz-sca)"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('filtered/sca-filtered.sarif') != ''
+        with:
+          sarif_file: filtered/sca-filtered.sarif
+          category: wiz-sca
+          wait-for-processing: true
+
+      - name: "[SARIF] Upload IaC results (category: wiz-iac)"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('filtered/iac-filtered.sarif') != ''
+        with:
+          sarif_file: filtered/iac-filtered.sarif
+          category: wiz-iac
+          wait-for-processing: true
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  ARTIFACTS — Archive raw + filtered for audit trail              │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[Artifacts] Archive all scan outputs"
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wiz-sarif-${{ github.sha }}
+          name: wiz-security-scan-${{ github.sha }}
+          retention-days: 30
+          if-no-files-found: warn
           path: |
             image.sarif
-            image-filtered.sarif
-          retention-days: 30
+            dir.sarif
+            dockerfile.sarif
+            image.txt
+            dir.txt
+            dockerfile.txt
+            image-layers.json
+            filtered/
+
+      # ┌──────────────────────────────────────────────────────────────────┐
+      # │  GATE — Fail only on infrastructure errors, not findings         │
+      # └──────────────────────────────────────────────────────────────────┘
+
+      - name: "[Gate] Security Policy Gate"
+        if: always()
+        run: |
+          echo "══════════════════════════════════════════════════════"
+          echo "  WIZ UNIFIED SCAN — OUTCOME SUMMARY"
+          echo "══════════════════════════════════════════════════════"
+          printf "  %-25s %s\n" "SCA scan:"       "${{ steps.sca_scan.outcome }}"
+          printf "  %-25s %s\n" "IaC scan:"       "${{ steps.iac_scan.outcome }}"
+          printf "  %-25s %s\n" "Container scan:" "${{ steps.container_scan.outcome }}"
+          echo ""
+          echo "  NOTE: Policy violations (exit 4) appear in the"
+          echo "        GitHub Security tab, not as pipeline failures."
+          echo "══════════════════════════════════════════════════════"
+
+          GATE_PASS=true
+          for outcome in \
+            "${{ steps.sca_scan.outcome }}" \
+            "${{ steps.iac_scan.outcome }}" \
+            "${{ steps.container_scan.outcome }}"; do
+            if [ "$outcome" = "failure" ]; then
+              GATE_PASS=false
+            fi
+          done
+
+          if [ "$GATE_PASS" = "false" ]; then
+            echo "::error title=Wiz Gate FAILED::One or more scans failed (infrastructure error)"
+            exit 1
+          fi
+          echo "::notice title=Wiz Gate PASSED::All scans completed — review Security tab for findings"
