@@ -51,15 +51,17 @@ jobs:
         id: container_scan
         continue-on-error: true
         run: |
+          # '|| EXIT=$?' captures exit code without triggering set -e on non-zero exit
+          EXIT=0
           ./wizcli docker scan \
             --image "$IMAGE_TAG" \
             --output image.sarif \
             --format sarif \
+            --policy "Default vulnerabilities policy" \
             --tag repo="${{ github.repository }}" \
             --tag branch="${{ github.ref_name }}" \
-            --tag commit="${{ github.sha }}"
+            --tag commit="${{ github.sha }}" || EXIT=$?
 
-          EXIT=$?
           echo "container_exit=$EXIT" >> $GITHUB_OUTPUT
           if [ $EXIT -eq 0 ]; then
             echo "✔ Scan passed — no policy violations"
