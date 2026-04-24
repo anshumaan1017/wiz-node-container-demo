@@ -1,0 +1,12 @@
+{
+  "name": "wiz-node-container-demo",
+  "version": "1.0.0",
+  "description": "Simple Node.js app for Wiz container vulnerability scanning demo",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "4.18.2"
+  }
+}

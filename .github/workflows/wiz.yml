@@ -1,0 +1,77 @@
+name: Wiz — Container Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wiz-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container-scan:
+    name: Wiz — Container Image Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+
+    env:
+      IMAGE_TAG: wiz-node-container-demo:${{ github.sha }}
+
+    steps:
+      - name: "[Setup] Checkout source code"
+        uses: actions/checkout@v4
+
+      - name: "[Setup] Install Wiz CLI (latest release)"
+        run: |
+          curl -fsSL https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64 -o wizcli
+          chmod +x wizcli
+          ./wizcli version
+
+      - name: "[Setup] Authenticate Wiz CLI"
+        run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+
+      - name: "[Build] Build Docker image"
+        run: |
+          docker build -t "$IMAGE_TAG" .
+          echo "Built: $IMAGE_TAG"
+
+      - name: "[Scan] Container Image — Full Vulnerability Scan (all layers)"
+        id: container_scan
+        continue-on-error: true
+        run: |
+          ./wizcli docker scan \
+            --image "$IMAGE_TAG" \
+            --output image.sarif \
+            --format sarif \
+            --driver mountWithLayers \
+            --policy "Default vulnerabilities policy" \
+            --tag repo="${{ github.repository }}" \
+            --tag branch="${{ github.ref_name }}" \
+            --tag commit="${{ github.sha }}"
+
+          EXIT=$?
+          echo "container_exit=$EXIT" >> $GITHUB_OUTPUT
+          if [ $EXIT -eq 0 ]; then
+            echo "✔ Scan passed — no policy violations"
+          elif [ $EXIT -eq 4 ]; then
+            echo "⚠ Scan complete — policy violations found (exit 4); see Security tab"
+          else
+            echo "✘ Scan failed with exit $EXIT — infrastructure or auth error"
+            exit $EXIT
+          fi
+
+      - name: "[SARIF] Upload Container Scan Results to GitHub Security"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: image.sarif
+          category: wiz-container
