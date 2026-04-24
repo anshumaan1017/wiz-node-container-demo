@@ -217,3 +217,30 @@ jobs:
           sarif_file:          image.sarif
           category:            wiz-image
           wait-for-processing: true
+
+      # ── Close stale SCA/IaC alerts (upload empty SARIFs) ────────────────────
+      # Previously we uploaded SCA and IaC to separate categories.
+      # Upload empty results so GitHub auto-closes those stale alerts.
+
+      - name: "[Cleanup] Close stale SCA/IaC Security alerts"
+        if:   always()
+        run: |
+          cat > /tmp/empty.sarif << 'EOF'
+          {"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"WizCLI","version":"0.0.0"}},"results":[]}]}
+          EOF
+
+      - name: "[Cleanup] Upload empty SCA SARIF (close stale wiz-sca alerts)"
+        if:   always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file:          /tmp/empty.sarif
+          category:            wiz-sca
+          wait-for-processing: true
+
+      - name: "[Cleanup] Upload empty IaC SARIF (close stale wiz-iac alerts)"
+        if:   always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file:          /tmp/empty.sarif
+          category:            wiz-iac
+          wait-for-processing: true
