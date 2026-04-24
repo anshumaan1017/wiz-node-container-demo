@@ -29,9 +29,12 @@ jobs:
 
       - name: "[Setup] Install Wiz CLI (latest release)"
         run: |
-          curl -fsSL https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64 -o wizcli
+          # Always fetch the latest wizcli binary — no pinned version
+          LATEST_URL="https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64"
+          echo "Downloading wizcli from $LATEST_URL"
+          curl -fsSL "$LATEST_URL" -o wizcli
           chmod +x wizcli
-          ./wizcli version
+          echo "Installed wizcli version: $(./wizcli version 2>&1 | head -1)"
 
       - name: "[Setup] Authenticate Wiz CLI"
         run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
@@ -70,7 +73,7 @@ jobs:
           fi
 
       - name: "[SARIF] Upload Container Scan Results to GitHub Security"
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: image.sarif
