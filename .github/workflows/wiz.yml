@@ -47,7 +47,7 @@ jobs:
           docker build -t "$IMAGE_TAG" .
           echo "Built: $IMAGE_TAG"
 
-      - name: "[Scan] Container Image — Full Vulnerability Scan (all layers)"
+      - name: "[Scan] Container Image — Full Vulnerability Scan"
         id: container_scan
         continue-on-error: true
         run: |
@@ -55,8 +55,6 @@ jobs:
             --image "$IMAGE_TAG" \
             --output image.sarif \
             --format sarif \
-            --driver mountWithLayers \
-            --policy "Default vulnerabilities policy" \
             --tag repo="${{ github.repository }}" \
             --tag branch="${{ github.ref_name }}" \
             --tag commit="${{ github.sha }}"
