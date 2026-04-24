@@ -77,9 +77,26 @@ jobs:
             exit $EXIT
           fi
 
-      - name: "[SARIF] Upload Container Scan Results to GitHub Security"
+      - name: "[Report] Parse findings — filter noise, write summary"
+        if: always()
+        run: |
+          echo "::group::Parse container scan SARIF"
+          python3 scripts/parse_container_scan.py image.sarif image-filtered.sarif
+          echo "::endgroup::"
+
+      - name: "[SARIF] Upload filtered results to GitHub Security"
         uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
-          sarif_file: image.sarif
+          sarif_file: image-filtered.sarif
           category: wiz-container
+
+      - name: "[Artifacts] Archive raw + filtered SARIFs"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wiz-sarif-${{ github.sha }}
+          path: |
+            image.sarif
+            image-filtered.sarif
+          retention-days: 30
