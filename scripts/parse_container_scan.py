@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sys
+from typing import Optional, Tuple, Dict, List
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,7 +63,7 @@ CVSS_MAP = {
 # JSON / SARIF helpers
 # ---------------------------------------------------------------------------
 
-def load_json(path: str) -> dict | None:
+def load_json(path: str) -> Optional[dict]:
     if not path or not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as f:
@@ -83,18 +84,44 @@ def get_str(obj: dict, *keys, default="") -> str:
     return default
 
 
+def parse_message_text(text: str) -> dict:
+    """Parse Wiz 'Key: Value' lines from message.text.
+    Handles: Name, Severity, Component, Type, Version, Fixed version, Source, Description, Layer build command.
+    """
+    fields = {}
+    if not text:
+        return fields
+    for line in text.split("\n"):
+        line = line.strip()
+        # Match "Key: value" — key is alpha + spaces, max ~40 chars
+        m = re.match(r'^([A-Za-z][A-Za-z0-9 /\-\.]{0,40}):\s*(.*)$', line)
+        if m:
+            k = m.group(1).strip().lower()
+            v = m.group(2).strip()
+            if k not in fields:
+                fields[k] = v
+    return fields
+
+
 def get_severity(result: dict, rule_map: dict) -> str:
+    # Source 1: message.text "Severity: X" (most explicit in Wiz SARIF)
+    fields = parse_message_text(result.get("message", {}).get("text", ""))
+    sev = fields.get("severity", "").upper()
+    if sev in SEV_RANK:
+        return sev
+
+    # Source 2: result.properties.severity
     props = result.get("properties", {})
     sev = get_str(props, "severity", "Severity").upper()
     if sev in SEV_RANK:
         return sev
 
+    # Source 3: rule.properties.severity / security-severity
     rule = rule_map.get(result.get("ruleId", ""), {})
     sev = get_str(rule.get("properties", {}), "severity", "Severity").upper()
     if sev in SEV_RANK:
         return sev
 
-    # Check security-severity CVSS score on rule
     ss = get_str(rule.get("properties", {}), "security-severity")
     if ss:
         try:
@@ -110,36 +137,53 @@ def get_severity(result: dict, rule_map: dict) -> str:
         except ValueError:
             pass
 
-    # Fall back to SARIF level
+    # Source 4: SARIF level
     level = result.get("level", "note")
     return {"error": "HIGH", "warning": "MEDIUM"}.get(level, "LOW")
 
 
 def get_fixed_version(result: dict, rule_map: dict) -> str:
+    # Source 1: message.text "Fixed version: X"
+    fields = parse_message_text(result.get("message", {}).get("text", ""))
+    fv = fields.get("fixed version", "")
+    if fv:
+        return fv
+
+    # Source 2: result.properties
     props = result.get("properties", {})
     fv = get_str(props, "fixedVersion", "fixed_version", "fixVersion",
                  "remediationVersion", "remediation")
     if fv:
         return fv
+
+    # Source 3: rule.properties
     rule = rule_map.get(result.get("ruleId", ""), {})
     return get_str(rule.get("properties", {}), "fixedVersion", "fixed_version")
 
 
 def get_package_name_ver(result: dict, rule_map: dict) -> tuple:
+    # Source 1: message.text "Component: X" and "Version: X" (primary for Wiz SARIF)
+    fields = parse_message_text(result.get("message", {}).get("text", ""))
+    name = fields.get("component", "")
+    ver = fields.get("version", "")
+    if name:
+        return name, ver
+
+    # Source 2: result.properties
     props = result.get("properties", {})
     name = get_str(props, "packageName", "package_name", "name")
     ver = get_str(props, "packageVersion", "package_version", "version")
+    if name:
+        return name, ver
 
-    if not name:
-        rule = rule_map.get(result.get("ruleId", ""), {})
-        desc = get_str(rule.get("shortDescription", {}), "text")
-        m = re.search(r" in ([^\s]+)\s+([\d][\S]*)", desc)
-        if m:
-            name, ver = m.group(1), m.group(2)
-        else:
-            name = result.get("ruleId", "")
+    # Source 3: rule shortDescription fallback
+    rule = rule_map.get(result.get("ruleId", ""), {})
+    desc = get_str(rule.get("shortDescription", {}), "text")
+    m = re.search(r" in ([^\s]+)\s+([\d][\S]*)", desc)
+    if m:
+        return m.group(1), m.group(2)
 
-    return name, ver
+    return result.get("ruleId", ""), ver
 
 
 def get_source_path(result: dict) -> str:
@@ -156,11 +200,13 @@ def get_source_path(result: dict) -> str:
 
 
 def fingerprint(result: dict, rule_map: dict) -> str:
-    """Deterministic fingerprint for deduplication."""
+    """Deterministic fingerprint for deduplication.
+    Uses CVE + component + version (NOT source path or layer).
+    Per-layer duplicates of the same CVE in the same package collapse to one entry.
+    """
     rule_id = result.get("ruleId", "")
     name, ver = get_package_name_ver(result, rule_map)
-    src = get_source_path(result)
-    key = f"{rule_id}|{name}|{ver}|{src}"
+    key = f"{rule_id}|{name}|{ver}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -184,41 +230,45 @@ def enrich_sarif_rules(sarif: dict):
 # ---------------------------------------------------------------------------
 
 def classify_result(result: dict, rule_map: dict) -> str:
-    """Return 'APP' or 'OS'."""
-    props = result.get("properties", {})
+    """Return 'APP' or 'OS'.
+    Primary signal: Wiz message.text 'Type:' field.
+      'Library vulnerability' = APP (npm/pip/gem/etc.)
+      'Package vulnerability' = OS (apt/yum/apk)
+      'EOL vulnerability'     = OS
+      'CPE vulnerability'     = OS
+    """
+    msg = result.get("message", {}).get("text", "")
+    fields = parse_message_text(msg)
 
-    # 1. Explicit packageType field
+    # 1. Primary: Wiz 'Type:' field from message.text
+    vuln_type = fields.get("type", "").lower()
+    if "library" in vuln_type:
+        return "APP"
+    if vuln_type in ("package vulnerability", "eol vulnerability", "cpe vulnerability"):
+        return "OS"
+
+    # 2. result.properties.packageType
+    props = result.get("properties", {})
     pt = get_str(props, "packageType", "type", "package_type").upper()
-    if "APP" in pt or "APPLICATION" in pt:
+    if "APP" in pt or "APPLICATION" in pt or "LIBRARY" in pt:
         return "APP"
     if pt == "OS":
         return "OS"
 
-    # 2. Location URI heuristics
-    src = get_source_path(result)
-    app_indicators = ("/app/", "node_modules", "package.json", "package-lock.json",
-                      "yarn.lock", "pnpm-lock", ".npm", "requirements.txt",
-                      "Gemfile", "go.sum", "Cargo.lock", "composer.lock")
-    if src and any(ind in src for ind in app_indicators):
-        return "APP"
-
-    # 3. Rule helpUri heuristic
-    rule = rule_map.get(result.get("ruleId", ""), {})
-    help_uri = get_str(rule, "helpUri", "helpURI")
-    if not help_uri:
-        help_uri = get_str(rule.get("help", {}), "text", "markdown")
+    # 3. Source URL in message.text
+    source = fields.get("source", "")
     app_domains = ("github.com/advisories", "npmjs.com", "snyk.io", "ghsa",
                    "nodesecurity.io", "pypi.org")
     os_domains = ("security-tracker.debian.org", "ubuntu.com/security",
                   "access.redhat.com", "nvd.nist.gov", "cve.org")
-    if any(x in help_uri for x in app_domains):
+    if any(x in source for x in app_domains):
         return "APP"
-    if any(x in help_uri for x in os_domains):
+    if any(x in source for x in os_domains):
         return "OS"
 
-    # 4. Message text heuristic
-    msg = result.get("message", {}).get("text", "")
-    if any(ind in msg for ind in app_indicators):
+    # 4. Layer build command heuristic
+    layer_cmd = fields.get("layer build command", "")
+    if "npm install" in layer_cmd or "COPY package" in layer_cmd:
         return "APP"
 
     return "OS"
@@ -321,8 +371,11 @@ def filter_image_sarif(sarif: dict) -> tuple:
     app_findings.sort(key=sev_key)
     os_signal.sort(key=sev_key)
 
-    # Deduplicate
-    keep = deduplicate_results(app_findings + os_signal, rule_map)
+    # Deduplicate each category separately (for clean reporting)
+    app_deduped = deduplicate_results(app_findings, rule_map)
+    os_deduped = deduplicate_results(os_signal, rule_map)
+
+    keep = app_deduped + os_deduped
     keep_ids = {r.get("ruleId") for r in keep}
     kept_rules = [rule for rule in rules if rule.get("id") in keep_ids]
 
@@ -336,14 +389,16 @@ def filter_image_sarif(sarif: dict) -> tuple:
 
     stats = {
         "total_raw": len(results),
-        "app_kept": len(app_findings),
-        "os_actionable": len(os_signal),
+        "app_kept": len(app_deduped),
+        "app_raw": len(app_findings),
+        "os_actionable": len(os_deduped),
+        "os_actionable_raw": len(os_signal),
         "os_suppressed": len(os_suppressed),
         "final_kept": len(keep),
-        "app_counts": sev_counts(app_findings, rule_map),
-        "os_sig_counts": sev_counts(os_signal, rule_map),
-        "app_findings": app_findings,
-        "os_signal": os_signal,
+        "app_counts": sev_counts(app_deduped, rule_map),
+        "os_sig_counts": sev_counts(os_deduped, rule_map),
+        "app_findings": app_deduped,
+        "os_signal": os_deduped,
         "rule_map": rule_map,
     }
 
