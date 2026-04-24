@@ -28,15 +28,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: "[Setup] Install Wiz CLI (latest release)"
+        timeout-minutes: 3
         run: |
-          LATEST_URL="https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64"
-          echo "Downloading wizcli from $LATEST_URL"
-          curl -fsSL "$LATEST_URL" -o wizcli
-          chmod +x wizcli
-          echo "Installed wizcli version: $(./wizcli version 2>&1 | head -1)"
+          echo "::group::Download and install wizcli"
+          curl -fsSL \
+            -o /tmp/wizcli \
+            https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod +x /tmp/wizcli
+          sudo mv /tmp/wizcli /usr/local/bin/wizcli
+          echo "::endgroup::"
+          echo "::group::Verify wizcli installation"
+          wizcli version
+          echo "wizcli path: $(which wizcli)"
+          echo "::endgroup::"
 
       - name: "[Setup] Authenticate Wiz CLI"
-        run: ./wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+        run: wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
@@ -52,7 +59,7 @@ jobs:
         run: |
           # '|| EXIT=$?' captures exit code without triggering set -e on non-zero exit
           EXIT=0
-          ./wizcli docker scan \
+          wizcli docker scan \
             --image "$IMAGE_TAG" \
             --output image.sarif,sarif,vulnerabilities \
             --policies "Default vulnerabilities policy" \
