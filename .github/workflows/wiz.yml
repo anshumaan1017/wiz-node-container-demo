@@ -29,8 +29,7 @@ jobs:
 
       - name: "[Setup] Install Wiz CLI (latest release)"
         run: |
-          # Always fetch the latest wizcli binary — no pinned version
-          LATEST_URL="https://downloads.wiz.io/wizcli/latest/wizcli-linux-amd64"
+          LATEST_URL="https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64"
           echo "Downloading wizcli from $LATEST_URL"
           curl -fsSL "$LATEST_URL" -o wizcli
           chmod +x wizcli
@@ -55,9 +54,8 @@ jobs:
           EXIT=0
           ./wizcli docker scan \
             --image "$IMAGE_TAG" \
-            --output image.sarif \
-            --format sarif \
-            --policy "Default vulnerabilities policy" \
+            --output image.sarif,sarif,vulnerabilities \
+            --policies "Default vulnerabilities policy" \
             --tag repo="${{ github.repository }}" \
             --tag branch="${{ github.ref_name }}" \
             --tag commit="${{ github.sha }}" || EXIT=$?
